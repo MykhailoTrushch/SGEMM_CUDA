@@ -7,12 +7,32 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+#define CEIL_DIV(M, N) (((M) + (N) - 1) / (N))
+
+/*
+Matrix sizes:
+MxK * KxN = MxN
+
+Matmul: alpha * A x B + beta * C
+
+int M, N, K are sizes of matrices.
+float alpha is
+const float* A is the matrix A (size M*K)
+const float* B is the matrix B (size K*N)
+float beta is the coefficient by which the existing entry in C is multiplied
+float* C is the resulting matrix C
+
+Explanation:
+
+This kernel is very similar to the previous one, but we compute a 2D result matrix per kernel, in this case 8x8.
+This further improves the arithmetic intensity of the kernel.
+*/
 
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
 __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
     sgemm2DBlocktiling(int M, int N, int K, float alpha, const float *A,
-                       const float *B, float beta, float *C) {
+                       const float *B, float beta, float *C)
+{
   const uint cRow = blockIdx.y;
   const uint cCol = blockIdx.x;
 
@@ -56,13 +76,16 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   float regN[TN] = {0.0};
 
   // outer-most loop over block tiles
-  for (uint bkIdx = 0; bkIdx < K; bkIdx += BK) {
+  for (uint bkIdx = 0; bkIdx < K; bkIdx += BK)
+  {
     // populate the SMEM caches
-    for (uint loadOffset = 0; loadOffset < BM; loadOffset += strideA) {
+    for (uint loadOffset = 0; loadOffset < BM; loadOffset += strideA)
+    {
       As[(innerRowA + loadOffset) * BK + innerColA] =
           A[(innerRowA + loadOffset) * K + innerColA];
     }
-    for (uint loadOffset = 0; loadOffset < BK; loadOffset += strideB) {
+    for (uint loadOffset = 0; loadOffset < BK; loadOffset += strideB)
+    {
       Bs[(innerRowB + loadOffset) * BN + innerColB] =
           B[(innerRowB + loadOffset) * N + innerColB];
     }
@@ -73,16 +96,21 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
     B += BK * N; // move BK rows down
 
     // calculate per-thread results
-    for (uint dotIdx = 0; dotIdx < BK; ++dotIdx) {
+    for (uint dotIdx = 0; dotIdx < BK; ++dotIdx)
+    {
       // block into registers
-      for (uint i = 0; i < TM; ++i) {
+      for (uint i = 0; i < TM; ++i)
+      {
         regM[i] = As[(threadRow * TM + i) * BK + dotIdx];
       }
-      for (uint i = 0; i < TN; ++i) {
+      for (uint i = 0; i < TN; ++i)
+      {
         regN[i] = Bs[dotIdx * BN + threadCol * TN + i];
       }
-      for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
-        for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
+      for (uint resIdxM = 0; resIdxM < TM; ++resIdxM)
+      {
+        for (uint resIdxN = 0; resIdxN < TN; ++resIdxN)
+        {
           threadResults[resIdxM * TN + resIdxN] +=
               regM[resIdxM] * regN[resIdxN];
         }
@@ -92,8 +120,96 @@ __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
   }
 
   // write out the results
-  for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
-    for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
+  for (uint resIdxM = 0; resIdxM < TM; ++resIdxM)
+  {
+    for (uint resIdxN = 0; resIdxN < TN; ++resIdxN)
+    {
+      C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN] =
+          alpha * threadResults[resIdxM * TN + resIdxN] +
+          beta * C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN];
+    }
+  }
+}
+
+// re-implementing from memory
+template <const int BM, const int BN, const int BK, const int TM, const int TN>
+__global__ void __launch_bounds__((BM * BN) / (TM * TN), 1) sgemm2DBlocktiling_reimpl(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C)
+{
+  const uint cRow = blockIdx.y;
+  const uint cCol = blockIdx.x;
+
+  const uint resPerBlocktile = BM * BN;
+  const uint numThreadsBlocktile = resPerBlocktile / (TM * TN);
+  assert(numThreadsBlocktile == blockDim.x);
+
+  const int threadCol = threadIdx.x % (BN / TN);
+  const int threadRow = threadIdx.x / (BN / TN);
+
+  __shared__ float As[BM * BK];
+  __shared__ float Bs[BK * BN];
+
+  A += cRow * BM * K;
+  B += cCol * BN;
+  C += cRow * BM * N + cCol * BN;
+
+  // indices that this thread will load into shared memory
+  const uint innerColA = threadIdx.x % BK;
+  const uint innerRowA = threadIdx.x / BK;
+  const uint strideA = numThreadsBlocktile / BK;
+
+  const uint innerColB = threadIdx.x % BN;
+  const uint innerRowB = threadIdx.x / BN;
+  const uint strideB = numThreadsBlocktile / BN;
+
+  float threadResults[TM * TN] = {0.0};
+  float regM[TM] = {0.0};
+  float regN[TN] = {0.0};
+
+  for (uint bkIdx = 0; bkIdx < K; bkIdx += BK)
+  {
+    for (uint loadOffset = 0; loadOffset < BM; loadOffset += strideA)
+    {
+      As[(innerRowA + loadOffset) * BK + innerColA] =
+          A[(innerRowA + loadOffset) * K + innerColA];
+    }
+    for (uint loadOffset = 0; loadOffset < BK; loadOffset += strideB)
+    {
+      Bs[(innerRowB + loadOffset) * BN + innerColB] =
+          B[(innerRowB + loadOffset) * N + innerColB];
+    }
+    __syncthreads();
+
+    A += BK;
+    B += BK * N;
+
+    for (uint dotIdx = 0; dotIdx < BK; dotIdx++)
+    {
+      for (uint i = 0; i < TM; ++i)
+      {
+        regM[i] = As[(threadRow * TM + i) * BK + dotIdx];
+      }
+      for (uint i = 0; i < TN; ++i)
+      {
+        regN[i] = Bs[dotIdx * BN + threadCol * TN + i];
+      }
+
+      for (uint resIdxM = 0; resIdxM < TM; ++resIdxM)
+      {
+        for (uint resIdxN = 0; resIdxN < TN; ++resIdxN)
+        {
+          threadResults[resIdxM * TN + resIdxN] +=
+              regM[resIdxM] * regN[resIdxN];
+        }
+      }
+    }
+
+    __syncthreads();
+  }
+
+  for (uint resIdxM = 0; resIdxM < TM; resIdxM++)
+  {
+    for (uint resIdxN = 0; resIdxN < TN; resIdxN++)
+    {
       C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN] =
           alpha * threadResults[resIdxM * TN + resIdxN] +
           beta * C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN];
